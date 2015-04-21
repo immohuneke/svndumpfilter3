@@ -383,6 +383,7 @@ class Lump:
         if not self.propdict.has_key(key):
             self.proplist.append(key)
         self.propdict[key] = val
+        self.hasprop = True
 
     def delprop(self, key):
         """
@@ -410,7 +411,8 @@ class Lump:
                 else:
                     self.prop += "K %d\n%s\n" % (len(key), key)
                     self.prop += "V %d\n%s\n" % (len(val), val)
-            self.prop = self.prop + "PROPS-END\n"
+            if self.hasprop:
+                self.prop = self.prop + "PROPS-END\n"
 
         # Now fix up the content length headers.
         if len(self.prop) > 0:
@@ -418,7 +420,7 @@ class Lump:
         else:
             self.delhdr("Prop-content-length")
 
-        if len(self.text) > 0 or \
+        if self.hastext and len(self.text) >= 0 or \
            (self.hdrdict.get('Node-action', None) == 'add' and
             self.hdrdict.get('Node-kind', None) == 'file' and
             not self.hdrdict.get('Node-copyfrom-path', None)):
@@ -503,12 +505,14 @@ def read_lump(f):
     lump, lines = read_rfc822_headers(f)
     if lump is None:
         return None
-    pcl = int(lump.hdrdict.get("Prop-content-length", "0"))
-    tcl = int(lump.hdrdict.get("Text-content-length", "0"))
-    if pcl > 0:
+    pcl = int(lump.hdrdict.get("Prop-content-length", "-1"))
+    tcl = int(lump.hdrdict.get("Text-content-length", "-1"))
+    lump.hasprop = pcl >= 0
+    if lump.hasprop:
         lump.prop = f.read(pcl)
         lump.propparse()
-    if tcl > 0:
+    lump.hastext = tcl >= 0
+    if lump.hastext:
         lump.text = f.read(tcl)
 
     lump.orig_text = os.linesep.join(lines) + lump.prop + lump.text
@@ -536,30 +540,6 @@ def write_lump(f, lump):
     if not lump.hdrdict.has_key("Revision-number"):
         f.write('\n')
 
-def write_one_mkdir(f, dirname):
-    f.write("Node-path: " + dirname + "\n")
-    f.write("Node-kind: dir\n")
-    f.write("Node-action: add\n")
-    f.write("Prop-content-length: 10\n")
-    f.write("Content-length: 10\n")
-    f.write("\nPROPS-END\n\n\n")
-
-mkdirhistory={}
-
-def write_mkdir(f, dirname, create=1):
-    """
-    write directory creation lump to file
-    """
-    dirs=splitpath(dirname)
-    c=0
-    for d in dirs:
-        c+=1
-        tobecreated="/".join(dirs[0:c])
-        if mkdirhistory.has_key(tobecreated):
-            continue
-        mkdirhistory[tobecreated]=1
-        if create:
-            write_one_mkdir(f, tobecreated)
 
 def fetch_rev_rename(repos, srcrev, srcpath, path, fout, flog, format):
     """
@@ -572,9 +552,9 @@ def fetch_rev_rename(repos, srcrev, srcpath, path, fout, flog, format):
 
     # Must find the source node, as it existed in the given revision, and copy
     # it in full.
-    cmd = ('svnadmin', 'dump', '-r', str(srcrev),
-           opts.repos, srcpath)
-    cmd_filter = ('svndumpfilter', 'include', srcpath)
+    cmd = ('svnadmin', 'dump', '-r', str(srcrev), opts.repos)
+    cmd_filter = ('svndumpfilter', '--skip-missing-merge-sources',
+                  'include', srcpath)
     if opts.debug:
         print >> flog, ("Running command: '%s | %s'" %
                         (' '.join(cmd), ' '.join(cmd_filter)))
@@ -632,7 +612,7 @@ def fetch_rev_rename(repos, srcrev, srcpath, path, fout, flog, format):
 
     p2.wait()
     if p2.returncode != 0:
-        raise SystemExit("Error: Running %s" % " ".join(cmd + ("##",) + cmd_filter))
+        raise SystemExit("Error: Running %s" % " ".join(cmd))
 
 
 def parse_options():
@@ -843,33 +823,11 @@ def main():
                 '   %-10s %-10s %s' %
                 (d.get('Node-kind', ''), d['Node-action'], d['Node-path']))
 
-        module=os.environ["MODULE"]
-        if lump.hdrdict.has_key("Node-copyfrom-path") and not re.search('/'+module+'(/|$)', lump.hdrdict["Node-copyfrom-path"]):
-            # catch copies of whole trunk / branches (that include our module)
-            origsrcpath = lump.hdrdict["Node-copyfrom-path"]
-            srcrevision = lump.hdrdict["Node-copyfrom-rev"]
-            re_interesting='((^branches/.+)|(^tags/[^/]+$)|(^trunk$))'
-            srcpath = re.sub(re_interesting, '\\1/' + module, origsrcpath)
-            print >> flog, "Node-copyfrom-path: " + srcpath + "R:" + srcrevision + "  NodeP:" + lump.hdrdict["Node-path"]
-            if lump.hdrdict["Node-copyfrom-path"] != srcpath:
-                svncmd = "svn ls -r " + srcrevision + " file://" + opts.repos + "/" + origsrcpath + " | grep -q ^" + module +"/$"
-                print >> flog, svncmd
-                if os.system(svncmd) == 0:
-                    write_mkdir(fw, lump.hdrdict["Node-path"])
-                    lump.hdrdict["Node-path"] = re.sub(re_interesting, '\\1/' + module, lump.hdrdict["Node-path"])
-                    print >> flog, "replaced Node-path:" + lump.hdrdict["Node-path"] + " ## Node-copyfrom-path: " + srcpath
-                    lump.hdrdict["Node-copyfrom-path"] = srcpath
-
         # Filter out the uninteresting lumps
         path = lump.hdrdict['Node-path']
         if not paths.interesting(path):
-            # add missing branch dirs
-            if lump.hdrdict['Node-action'] == 'add' and lump.hdrdict['Node-kind'] == 'dir' and re.match("((^branches)|(^tags/?[^/]*$)|(^trunk$))",lump.hdrdict['Node-path']):
-                write_mkdir(fw, lump.hdrdict['Node-path'])
-                continue
             filtered.add(path)
             continue
-        write_mkdir(fw, lump.hdrdict['Node-path'], False)
 
         # See if any of the provided filters match against this file
         num_subs = 0
